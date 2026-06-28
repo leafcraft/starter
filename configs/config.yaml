@@ -1,0 +1,352 @@
+# starter — Starter mesh (build from scratch)
+#
+# ─────────────────────────────────────────────────────────────────────
+# READ THIS FILE TOP TO BOTTOM. It is a working 3-agent mesh AND a
+# tutorial. Every block is commented so you can copy a pattern, rename
+# it, and grow your own department. Run it as-is first:
+#
+#     pip install -r requirements.txt
+#     docker run -d -p 6379:6379 redis:7-alpine     # state store
+#     cp env .env  &&  edit .env  (LEAFMESH_LICENSE_KEY, OPENAI_API_KEY)
+#     python validate_config.py                     # pre-flight check
+#     python main.py                                # API at :18820/docs
+#
+# Then trigger the example flow:
+#
+#     curl -X POST http://127.0.0.1:18820/api/mesh/call \
+#       -H "Content-Type: application/json" \
+#       -d '{"entry_point": "new_request",
+#            "input_data": {"source": "manual",
+#                           "message": "Please refund order 1234"}}'
+#
+# ─────────────────────────────────────────────────────────────────────
+# THE MENTAL MODEL (the one thing to internalise)
+#
+#   A mesh is a TEAM of agents that talk peer-to-peer, not a pipeline.
+#   • An agent is a person you'd HIRE — its name is a job title, its
+#     prompt is the job description, its yields are what it hands back.
+#   • Agents call each other via `can_call:` with a `condition:` on the
+#     wire — that condition IS the business rule, written where anyone
+#     can read it (no logic hidden in Python).
+#   • The Manager hovers above and only steps in on exceptions.
+#   • YAML-FIRST: most agents need NO Python. The SDK turns `yields:`
+#     into structured output automatically. Add a Python module only
+#     for things YAML can't do — see agency/README notes below.
+#
+# This starter has 3 agents: one LLM intake, one human review gate, one
+# WORM audit sink. Plus commented-out patterns (a second LLM agent, a
+# connector to your system of record, a scheduled cron) for you to
+# uncomment as you grow.
+# ─────────────────────────────────────────────────────────────────────
+
+name: "starter"
+version: "1.0.0"
+architecture: "managed_mesh"
+environment: "development"
+debug: true
+log_level: "INFO"
+
+# ── State store. Sessions, conversation history, dedup windows live in
+#    Redis. localhost works for dev; point at your managed Redis in prod.
+redis:
+  host: "${REDIS_HOST:localhost}"
+  port: ${REDIS_PORT:6379}
+  db: 0
+  password: "${REDIS_PASSWORD:}"
+  auto_storage: true
+  decode_responses: true
+  default_ttl: 86400
+  session_ttl: 86400
+
+# ── Agent auto-discovery. Any agency/<name>_agent.py whose function
+#    name matches an agent in this file is auto-wired. Pure-YAML agents
+#    (no module) just work — the SDK derives their behaviour from the
+#    prompt + yields below.
+auto_discover:
+  directory: "./agency"
+  pattern: "*_agent.py"
+  recursive: false
+
+# ── The Manager — supervisor, NOT a router. It watches the event
+#    stream via the Summarizer and intervenes only on escalations,
+#    narration hints, and contract violations. The agents route
+#    themselves through can_call wires.
+manager:
+  enabled: true
+  model: "gpt-4o-mini"
+  domain: "generic"
+  can_intervene: true
+  prompt: |
+    This is a starter mesh. A request comes in, intake_agent reads it
+    and decides whether it needs a human; routine items it answers
+    itself, sensitive ones go to reviewer_human. Everything ends in
+    the audit log.
+
+    Escalate when:
+      - intake_agent fails to classify after its retries
+      - reviewer_human does not respond within the timeout
+  routing:
+    mode: "learning"          # "static" for regulated/safety paths
+    confidence_threshold: 0.7
+    fallback: "all"
+
+mesh:
+  call_timeout: 120
+
+# ─────────────────────────────────────────────────────────────────────
+# DATA STRUCTURES — the canonical shape of things flowing through the
+# mesh. Optional, but declaring them documents your domain and lets the
+# SDK validate inputs. `required:` lists the fields an entry payload
+# MUST carry.
+# ─────────────────────────────────────────────────────────────────────
+data_structures:
+  Request:
+    type: "object"
+    properties:
+      request_id:  { type: "string" }
+      source:      { type: "string" }   # manual | email | webform | api
+      message:     { type: "string" }
+      received_at_utc: { type: "string" }
+    required: ["source"]
+
+# ─────────────────────────────────────────────────────────────────────
+# ENTRY POINTS — every real-world trigger that can START a workflow.
+# Name them after the TRIGGER (what happened in the world), point them
+# at the agent that owns the first decision. A mesh has many doors.
+# ─────────────────────────────────────────────────────────────────────
+entry_points:
+  - name: "new_request"
+    target: "intake_agent"
+    description: "A new request arrives (form, email, manual entry)"
+
+  # Direct-call door — hit one agent directly, bypassing the chain.
+  # Handy for debugging / replay / programmatic ingest.
+  - name: "direct_call_intake"
+    target: "intake_agent"
+    description: "Run intake on one payload directly (debug / replay)"
+
+  # ── PATTERN: a scheduled entry point (cron). Uncomment the agent's
+  #    `wake_up:` below to enable. A door that time opens, not a person.
+  # - name: "nightly_sweep"
+  #   target: "your_cron_agent"
+  #   description: "Nightly housekeeping sweep"
+
+# ─────────────────────────────────────────────────────────────────────
+# AGENTS — the team.
+# ─────────────────────────────────────────────────────────────────────
+agents:
+
+  # ── 1) LLM AGENT ────────────────────────────────────────────────
+  # The most common kind. No Python needed: the SDK sends the prompt to
+  # the model, forces a JSON response matching `yields:`, and fills any
+  # missing key with a type default so the wires below always evaluate.
+  #
+  # The wires under `can_call:` ARE the routing policy. Read them like
+  # business rules: "if it needs a human, send it to the reviewer;
+  # otherwise log it and finish."
+  intake_agent:
+    name: "intake_agent"
+    agent_type: "llm"
+    description: "Reads an incoming request, classifies it, decides if a human must review"
+    model: "gpt-4o-mini"
+    temperature: 0.1
+    communication_type: "chain"
+    prompt: |
+      You are the intake desk. Read the incoming request and classify it.
+
+      Decide:
+        - category: one of [question, complaint, refund, other]
+        - priority: one of [low, normal, high]
+        - needs_human: true ONLY when the request involves money,
+          a complaint, or anything you are not confident answering.
+        - draft_reply: a short, polite reply IF needs_human is false;
+          otherwise leave it empty (a human will write it).
+        - summary: one sentence a human reviewer could act on.
+
+      Echo `request_id` from the input unchanged so downstream steps
+      stay addressable.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly
+      these keys:
+      {"category": "", "priority": "", "needs_human": false, "draft_reply": "", "summary": "", "request_id": ""}
+
+    # enforce_yields makes `yields:` a hard contract: on a bad-shape
+    # response the Manager retries the agent with the validation error.
+    enforce_yields: true
+    enforce_yields_retry: 2
+
+    # `yields:` doubles as the structured-output schema AND the set of
+    # fields the wires below (and downstream agents) may reference.
+    yields:
+      category: "string"
+      priority: "string"
+      needs_human: "boolean"
+      draft_reply: "string"
+      summary: "string"
+      request_id: "string"
+
+    inputs:
+      message: "string"
+      source: "string"
+
+    # ── The routing policy, as wires. Conditions reference THIS agent's
+    #    own yields. Exactly one fires per run here, but a mesh can
+    #    fan out to several at once.
+    can_call:
+      # Needs a human → hand to the reviewer gate.
+      - agent: "reviewer_human"
+        condition: "calling_agent_response.needs_human == true"
+
+      # Routine → straight to the audit log (intake already drafted it).
+      - agent: "audit_logger_agent"
+        condition: "calling_agent_response.needs_human == false"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ── 2) HUMAN AGENT (HITL gate) ──────────────────────────────────
+  # A real person in the loop. `human_interface: default` routes the
+  # task to the hosted Studio inbox; swap in Slack/Teams/webhook later.
+  # The person replies with one of the words the wires expect (below).
+  #
+  # IMPORTANT: when a human responds, the SDK delivers their reply as
+  # `human_message` (and other human_* meta fields) — NOT as your
+  # declared yields. So wire conditions on a human agent must read
+  # `calling_agent_response.human_message`, never `.decision`.
+  reviewer_human:
+    name: "reviewer_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Reviews sensitive requests before any reply is sent"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 3600          # 1 hour, then the fallback fires
+
+    # operator_ids: ["you@yourcompany.com"]   # optional. UNSET = shared
+    #   inbox (everyone sees it). Only set REAL emails — a placeholder
+    #   assigns the task to a nonexistent person and it shows up in no
+    #   inbox at all.
+
+    # Default-deny on silence: if no one answers in time, the workflow
+    # does NOT auto-approve — it records the timeout and stops.
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "halt_for_review"
+      message: "halt_for_review"          # must match a wire token below
+      note: "Reviewer did not respond — held for manual review"
+
+    yields:
+      decision: "string"
+      notes: "string"
+    inputs:
+      summary: "string"
+      request_id: "string"
+
+    human_prompt_template: |
+      Review this request before any reply goes out.
+      Reply "approve" to send, "reject" to decline.
+      Summary: {{summary}}
+
+    can_call:
+      # The person's reply arrives as human_message. Route on it.
+      - agent: "audit_logger_agent"
+        condition: "calling_agent_response.human_message == 'approve' or calling_agent_response.human_message == 'reject' or calling_agent_response.human_message == 'halt_for_review'"
+
+  # ── 3) AUDIT SINK (external, WORM) ──────────────────────────────
+  # The terminus of every flow. Hash-chained, append-only — tamper
+  # evident. This is the ONE bit of Python the starter ships
+  # (agency/_shared/audit_logger.py), registered in main.py. Leave it;
+  # it's your compliance backbone.
+  audit_logger_agent:
+    name: "audit_logger_agent"
+    agent_type: "external"
+    description: "Hash-chained WORM audit — the immutable terminus of every flow"
+    framework: "custom"
+    communication_type: "execute"
+    connector_config:
+      sink_type: "local_file"
+      local_file_path: "./logs/audit.jsonl"
+    yields:
+      audit_event_id: "string"
+      written_at_utc: "string"
+      hash_chain_prev: "string"
+      hash_chain_current: "string"
+    inputs:
+      session_id: "string"
+      payload: "object"
+    can_call: []          # terminal — the buck stops here
+
+  # ─────────────────────────────────────────────────────────────────
+  # PATTERNS TO GROW INTO — copy, uncomment, rename. (Commented out so
+  # the starter runs clean; `validate_config.py` will check them once
+  # you enable them.)
+  # ─────────────────────────────────────────────────────────────────
+
+  # ── PATTERN A: a second LLM agent the intake can hand off to.
+  #    e.g. a drafter that writes the customer-facing reply. Add a wire
+  #    on intake_agent: → responder_agent when needs_human == false,
+  #    and have responder_agent → audit_logger_agent.
+  #
+  # responder_agent:
+  #   name: "responder_agent"
+  #   agent_type: "llm"
+  #   description: "Writes the final customer reply for routine requests"
+  #   model: "gpt-4o-mini"
+  #   temperature: 0.3
+  #   communication_type: "chain"
+  #   prompt: |
+  #     Write a warm, concise reply to the customer based on the
+  #     intake summary and draft.
+  #     OUTPUT CONTRACT — respond with ONLY valid JSON containing
+  #     exactly these keys:
+  #     {"reply_text": "", "request_id": ""}
+  #   enforce_yields: true
+  #   yields:
+  #     reply_text: "string"
+  #     request_id: "string"
+  #   can_call:
+  #     - agent: "audit_logger_agent"
+
+  # ── PATTERN B: a CONNECTOR agent — your system of record. The mesh
+  #    should NOT keep a private copy of your CRM/ERP/ticketing data.
+  #    A programmatic agent with `integration:` + `connector_config:`
+  #    calls YOUR system. No Python module needed.
+  #
+  # crm_lookup_agent:
+  #   name: "crm_lookup_agent"
+  #   agent_type: "programmatic"
+  #   description: "Looks up the customer in YOUR CRM (system of record)"
+  #   integration: "mcp"                  # or: zapier | composio | n8n
+  #   connector_config:
+  #     transport: "http"
+  #     url: "${CRM_MCP_URL:}"            # set in .env when you wire it
+  #     tool_name: "get_customer"
+  #   yields:
+  #     customer_id: "string"
+  #     tier: "string"
+  #   inputs:
+  #     email: "string"
+
+  # ── PATTERN C: a SCHEDULED agent (cron). `wake_up:` is a 5-field cron
+  #    expression. Nobody calls it — time does. Pair it with a matching
+  #    entry_point above. Keep crons commented until the agent's
+  #    dependencies (e.g. a connector) are actually wired, or the
+  #    schedule just fills the logs with errors.
+  #
+  # nightly_digest_agent:
+  #   name: "nightly_digest_agent"
+  #   agent_type: "llm"
+  #   description: "Summarises the day's requests for the team"
+  #   model: "gpt-4o-mini"
+  #   communication_type: "chain"
+  #   wake_up: "0 18 * * *"               # every day at 18:00
+  #   prompt: |
+  #     Summarise today's requests into a short team digest.
+  #     OUTPUT CONTRACT — respond with ONLY valid JSON containing
+  #     exactly these keys:
+  #     {"digest": "", "total_requests": 0}
+  #   yields:
+  #     digest: "string"
+  #     total_requests: "number"
+  #   can_call:
+  #     - agent: "audit_logger_agent"
