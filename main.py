@@ -1,8 +1,13 @@
-"""starter — Starter mesh entry point.
+"""starter — Starter Pod entry point (LeafMesh).
 
-This file boots the mesh and registers the one piece of Python the
-starter ships: the WORM audit sink. Everything else lives in
-configs/config.yaml. You rarely need to touch this file.
+Boot order matters (SDK 2.4.131):
+  1. import agency.tools  → the @global_tool decorators run BEFORE from_yaml/start,
+     so intake's lookup_requester is registered.
+  2. LeafMesh.from_yaml(...) → auto_discover wires agency/*_agent.py to the YAML
+     (intake floor + resolver finisher).
+  3. audit_logger.register(...) → attach the WORM sink to the custom external
+     audit_logger_agent (must be after from_yaml, before start).
+  4. leafmesh.start().
 """
 import asyncio
 import signal
@@ -11,8 +16,7 @@ import sys
 from dotenv import load_dotenv
 from leafmesh import EventType, LeafMesh, LeafMeshLogger
 
-# The audit sink is a custom external agent — SDK 2.4+ runs it via an
-# intelligence function registered on the instance (see config + module).
+import agency.tools  # noqa: F401 — registers @global_tool tools before start()
 from agency._shared import audit_logger as _audit_logger
 
 load_dotenv()
@@ -20,7 +24,7 @@ logger = LeafMeshLogger(__name__)
 
 leafmesh = LeafMesh.from_yaml("configs/config.yaml")
 
-# Register the WORM audit sink for the external audit_logger_agent.
+# WORM audit sink — terminus for resolutions, rejections, AND held gates.
 # Must happen after from_yaml() and before start().
 _audit_logger.register(leafmesh, "audit_logger_agent")
 
@@ -45,13 +49,16 @@ async def main():
     except AttributeError:
         pass
 
-    logger.info("starter — starter mesh running")
+    agents = leafmesh.registry.list_agents() if getattr(leafmesh, "registry", None) else []
+    if agents:
+        logger.info("Registered agents: " + ", ".join(f"{a.name} ({a.agent_type})" for a in agents))
+    logger.info("starter — starter pod running")
     logger.info("API docs: http://127.0.0.1:18820/docs")
 
     # ── Try it without curl — uncomment to fire one request on boot ──
     # result = await leafmesh.mesh_call(
     #     "new_request",
-    #     input_data={"source": "manual", "message": "What are your hours?"},
+    #     input_data={"source": "manual", "message": "What are your opening hours?"},
     # )
     # logger.info(f"Result: {result}")
 

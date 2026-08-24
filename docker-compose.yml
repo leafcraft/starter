@@ -15,7 +15,7 @@ services:
       timeout: 3s
       retries: 5
 
-  sales-orchestration:
+  app:
     build: .
     container_name: starter
     depends_on:
