@@ -44,10 +44,8 @@ async def main():
     leafmesh.event_bus.subscribe(EventType.INTERVENTION_NEEDED,  _on_intervention_needed)
     leafmesh.event_bus.subscribe(EventType.HUMAN_INPUT_TIMEOUT,  _on_human_input_timeout)
 
-    try:
-        await leafmesh.enable_self_healing()
-    except AttributeError:
-        pass
+    # Self-healing is automatic — the SDK enables it during start() on
+    # every operator-facing mesh. No call is needed.
 
     agents = leafmesh.registry.list_agents() if getattr(leafmesh, "registry", None) else []
     if agents:
