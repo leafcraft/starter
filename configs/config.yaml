@@ -27,16 +27,20 @@
 #   • Intake (AI) reads a request, classifies it, and decides — fail
 #     closed — whether a human must see it.
 #   • Reviewer (human) is a first-class MEMBER, not an endpoint. Every
-#     gate DEFAULT-DENIES on silence.
+#     gate DEFAULT-DENIES on silence: nothing is sent or approved unless a
+#     person says so.
 #   • Resolver (the FINISHER) is the actuator: it re-checks that it is
 #     actually authorised, enforces invariants a prompt can't waive,
 #     renders the REAL artifact to ./out, and DELETES it on a blocked
 #     floor — it never fakes a result.
 #   • The audit sink is the WORM terminus of every path.
-#   • The Manager SUPERVISES — it watches hand-offs and escalates
-#     stalls / timeouts / contract violations to the human. It is NOT a
-#     router in the middle of the team; the agents route themselves via
-#     `can_call` wires, and each wire's `condition` IS the business rule.
+#   • The Manager SUPERVISES — it watches hand-offs and escalates real
+#     failures (an error that retrying cannot fix, too many failed agents
+#     in one session, restarts used up) to the human. It does NOT chase an
+#     unanswered question, and a broken output contract only alerts people.
+#     It is NOT a router in the middle of the team; the agents route
+#     themselves via `can_call` wires, and each wire's `condition` IS the
+#     business rule.
 #
 #   YAML-FIRST: topology, routing, prompts, and contracts all live here.
 #   Python appears for exactly three things — an actuator with side
@@ -55,21 +59,6 @@ environment: "development"
 debug: true
 log_level: "INFO"
 
-# ── State store. Sessions, conversation history, dedup windows, and the
-#    HITL-recovery ladder live in Redis. localhost works for dev; point
-#    at your managed Redis in prod.
-persistence:
-  backend: redis
-  redis:
-    host: "${REDIS_HOST:localhost}"
-    port: ${REDIS_PORT:6379}
-    db: 0
-    password: "${REDIS_PASSWORD:}"
-    auto_storage: true
-    decode_responses: true
-    default_ttl: 86400
-    session_ttl: 86400
-
 # ── Agent auto-discovery. Any agency/<name>_agent.py whose function name
 #    matches an agent below is auto-wired (binding is by NAME — a mismatch
 #    is silent dead code, so keep them equal). Pure-YAML agents with no
@@ -82,8 +71,13 @@ auto_discover:
   recursive: false
 
 # ── The Manager — SUPERVISOR, not a router. It watches the event stream
-#    and steps in only on escalations: a stalled hand-off, a gate that
-#    timed out, an agent that can't satisfy its contract. Static routing
+#    and escalates to the targets below only when (leafmesh 2.4.486):
+#      • an agent hits an error retrying cannot fix (auth, bad request,
+#        out of credit, bad config) — on the first occurrence;
+#      • max_errors_per_session different agents fail in one session;
+#      • an agent's restart attempts are used up.
+#    A question nobody answers is NOT escalated: the seat waits its time and
+#    stops. A broken output contract only ALERTS people. Static routing
 #    because this is a control path (approvals, audit) — nothing here
 #    should be "learned". The agents route themselves through their wires.
 manager:
@@ -94,15 +88,13 @@ manager:
     and decides — failing closed — whether a human must review it. Routine
     items go straight to the resolver; sensitive ones (money, complaints,
     anything low-confidence) go to reviewer_human first. The resolver
-    produces the artifact only when it is genuinely authorised. Everything
-    ends in the audit log.
+    produces the artifact only when it is genuinely authorised. Every
+    decision a person or the finisher makes ends in the audit log.
 
-    Escalate to reviewer_human when:
-      - intake_agent cannot satisfy its output contract after its retries,
-      - reviewer_human does not respond within its timeout,
-      - the resolver blocks a request it should have been able to finish,
-      - any agent hands off a malformed artifact.
-    Silence never advances a request.
+    Escalate to reviewer_human when an agent fails with an error retrying
+    cannot fix, or when several agents fail in the same session. A request
+    the reviewer has not answered is not escalated; it waits and closes
+    unanswered. Silence never advances a request.
   routing:
     mode: "static"          # control path — deterministic, reviewable
   escalation:
@@ -111,11 +103,12 @@ manager:
         agent: reviewer_human
     auto_escalate:
       max_retries: 3            # bounds the enforce_yields self-correction loop
-      max_errors_per_session: 5
-      timeout_threshold: 2
+      # 2 of this pod's 3 working agents failing in one request is systemic —
+      # a person looks. (The default 5 could never trip in a 4-member pod.)
+      max_errors_per_session: 2
 
-mesh:
-  call_timeout: 120
+timeouts:
+  mesh_call_default_timeout_s: 120
 
 # NOTE on 2.4.131 timeouts: the LLM hard timeout defaulted 300s → 90s in
 # 2.4.131 and now lives in a `timeouts:` block, NOT the old env var. This
@@ -155,7 +148,7 @@ entry_points:
     description: "Run intake on one payload directly (debug / replay / programmatic ingest)."
     condition: always
 
-  # HITL resume — the reviewer answers in their channel and the pod
+  # HITL resume — the reviewer answers in Studio's Inbox and the pod
   # continues from the gate. A door a PERSON opens, mid-flow.
   - name: "reviewer_reply"
     target: "reviewer_human"
@@ -163,8 +156,9 @@ entry_points:
     condition: always
 
   # ── PATTERN: a scheduled door (cron). Uncomment the matching agent's
-  #    `wake_up:` (PATTERN C at the foot of this file) to enable. A door
-  #    that TIME opens, not a person.
+  #    `wake_up:` (PATTERN C at the foot of this file) to enable — here before
+  #    the first start, in Studio's YAML editor after it. A door that TIME
+  #    opens, not a person.
   # - name: "nightly_sweep"
   #   target: "sweep_agent"
   #   description: "Nightly housekeeping sweep of aging requests."
@@ -186,7 +180,8 @@ agents:
   #
   # This agent has a backing module (agency/intake_agent.py) for ONE
   # reason: a `@chain` floor that the prompt cannot talk its way past —
-  # a sensitive category or a low-confidence read is FORCED to a human,
+  # a sensitive category, a high priority, a confidence below 0.7 or a
+  # routine item with no draft is FORCED to a human,
   # and the request is stashed so the finisher can recover it across the
   # HITL gap. The model decides; the code fails closed.
   intake_agent:
@@ -212,13 +207,15 @@ agents:
         - draft_reply: a short, polite reply IF needs_human is false;
           otherwise leave it empty (a human will write it).
         - summary: one sentence a human reviewer could act on.
+        - confidence: 0.0–1.0, how sure you are of the category. Below
+          0.7 the request goes to a human whatever you decided.
 
       Echo `request_id` from the input unchanged if present so downstream
       steps stay addressable (the floor mints one if it is missing).
 
       OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly
       these keys:
-      {"category": "", "priority": "", "needs_human": false, "draft_reply": "", "summary": "", "request_id": ""}
+      {"category": "", "priority": "", "needs_human": false, "draft_reply": "", "summary": "", "confidence": 0.0, "request_id": ""}
 
     # enforce_yields makes `yields:` a hard contract: on a bad-shape
     # response the Manager retries the agent with the validation error
@@ -234,6 +231,7 @@ agents:
       needs_human: "boolean"
       draft_reply: "string"
       summary: "string"
+      confidence: "number"      # < 0.7 → forced to a human by the floor
       request_id: "string"
 
     inputs:
@@ -256,9 +254,9 @@ agents:
           2. Classify category from the message's INTENT, not its keywords:
              a refund demand phrased as a question is still a refund.
           3. needs_human is a SAFETY decision, not a convenience one. Money
-             (refund), dissatisfaction (complaint), and low confidence all
-             force a human. Only [question, other] you can answer plainly
-             are routine.
+             (refund), dissatisfaction (complaint), high priority and low
+             confidence (below 0.7) all force a human — the floor enforces
+             it. Only [question, other] you can answer plainly are routine.
           4. If routine, write the draft_reply now — a routine item with no
              draft cannot be auto-resolved and the floor will send it to a
              human anyway.
@@ -275,17 +273,17 @@ agents:
     # chain must raise it (default 5 TRUNCATES SILENTLY; 20 is the ceiling) —
     # e.g. the reference extraction agent sets max_tool_calls_per_message: 15.
 
-    # ── To wire your real system of record (CRM / helpdesk), uncomment and
-    #    set the URL — each named action under `use:` becomes its own tool
-    #    (e.g. crm_get_customer). The SDK REJECTS an http mcp block with an
-    #    EMPTY url at load, so this ships COMMENTED: fill the URL, then
-    #    uncomment. The dev-store tool above is the fallback contract until
-    #    then. (MCP tools are namespaced <server>_<tool> and merge in
-    #    automatically — do NOT also list them under `tools:`.)
+    # ── To wire your real system of record (CRM / helpdesk): create the
+    #    vault connection 'crm_mcp' on Infrastructure → Integrations → MCP
+    #    (the MCP server's URL + token live there, never here), then
+    #    uncomment (here before the first start, in Studio's YAML editor
+    #    after it; applies live) — each named action under `use:` becomes its own tool
+    #    (e.g. crm_get_customer). The dev-store tool above is the fallback
+    #    contract until then. (MCP tools are namespaced <server>_<tool> and
+    #    merge in automatically — do NOT also list them under `tools:`.)
     # mcp:
-    #   - transport: http
-    #     url: "${CRM_MCP_URL}"
-    #     token: "${CRM_MCP_TOKEN:}"
+    #   - connection: crm_mcp   # vault connection holds the URL + token
+    #     transport: http
     #     use: [get_customer, list_tickets]
     #     name: crm
     #     timeout: 30
@@ -302,16 +300,22 @@ agents:
     auto_store_yields: true
 
   # ── 2) REVIEWER — the HITL gate (human, dual, first-class MEMBER) ─
-  # A real person in the loop, reached in the channel they already live in
-  # (a webhook to Slack / Teams / an inbox). `communication_type: dual`
+  # A real person in the loop, answering in Studio's Inbox (or, with a
+  # webhook_config: {connection: <vault record>}, an external tool).
+  # `communication_type: dual`
   # belongs HERE and only here — the human/webhook boundary. Its wires
   # target CHAIN peers, never another dual agent (dual→dual is unbounded
   # ping-pong the SDK warns on).
   #
   # DEFAULT-DENY on silence: if no one answers in time, the flow does NOT
-  # auto-approve — the fallback resolves to a NON-approving verdict
-  # (held_for_review) that is routed to the audit sink. Silence is recorded,
-  # never advanced.
+  # auto-approve. On leafmesh 2.4.486 this seat is "dual", and a dual seat's
+  # timeout routes nothing: after human_timeout_seconds the Inbox card
+  # closes and the ticket records that no reply came. Nothing is sent or
+  # approved on silence, and nobody is chased automatically.
+  # The fallback below is the declared intent — a NON-approving verdict
+  # (held_for_review) that matches the audit route. It does not route
+  # today; it is kept so the route is ready if the SDK starts sending a dual
+  # seat's fallback on.
   #
   # A human reply is delivered as `human_message` (+ other human_* meta),
   # NOT as declared yields — so every wire condition here reads
@@ -321,25 +325,18 @@ agents:
     agent_type: "human"
     is_human_powered: true
     description: "Request reviewer & accountable owner — approves or declines sensitive requests before any reply goes out."
-    human_interface: "webhook"
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: "dual"
-    human_timeout_seconds: 86400          # 1 day, then the default-deny fallback fires
+    human_timeout_seconds: 86400          # 24 h — one business day for a support lead to decide
 
     # operator_ids: ["you@yourcompany.com"]   # optional. UNSET = shared
     #   inbox (everyone sees it). Only set REAL emails — a placeholder
     #   assigns the task to a nonexistent person and it lands in no inbox.
 
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: { Content-Type: "application/json" }
-      outbound_timeout: 30
-      max_retries: 1
-      retry_delay: 2
-
     # Default-deny: on timeout the reviewer is treated as having HELD the
     # request for manual review — the fallback's human_message matches the
-    # 'held_for_review' route below, so silence lands in the audit log, not
-    # in an approval.
+    # 'held_for_review' route below, never an approval. (2.4.486: see the
+    # note above — today the card closes and nothing routes.)
     fallback_on_timeout: true
     fallback_response:
       human_decision: held
@@ -352,7 +349,7 @@ agents:
       request_id: "string"
 
     human_prompt_template: |
-      Review this request before any reply goes out.
+      Review request {{request_id}} before any reply goes out.
       Reply "approve" to resolve it, "reject" to decline.
       Summary: {{summary}}
 
@@ -360,7 +357,7 @@ agents:
       # Approved → the finisher issues the resolution.
       - agent: "resolver_agent"
         condition: "calling_agent_response.human_message == 'approve'"
-      # Rejected or held (incl. the timeout fallback) → straight to audit.
+      # Rejected or held (incl. the declared timeout fallback) → straight to audit.
       - agent: "audit_logger_agent"
         condition: "calling_agent_response.human_message == 'reject' or calling_agent_response.human_message == 'held_for_review'"
 
@@ -401,14 +398,15 @@ agents:
   # Hash-chained, append-only, tamper-evident. The ONE control this
   # starter ships as Python that isn't an actuator (agency/_shared/
   # audit_logger.py), registered in main.py via sdk.intelligence(). Every
-  # path ends here — an issued resolution, a rejection, AND every gate held
-  # on timeout. Leave it; it is your compliance backbone.
+  # decided path ends here — an issued resolution, a blocked one, a
+  # rejection, a hold. (A request nobody answered is recorded on its ticket,
+  # not here, on 2.4.486.) Leave it; it is your compliance backbone.
   audit_logger_agent:
     name: "audit_logger_agent"
     agent_type: "external"
     description: "Hash-chained WORM audit — the immutable terminus of every path."
     framework: "custom"
-    communication_type: "execute"
+    communication_type: "chain"
     connector_config:
       sink_type: "local_file"
       local_file_path: "./logs/audit.jsonl"
@@ -423,7 +421,8 @@ agents:
     can_call: []          # terminal — the buck stops here
 
   # ─────────────────────────────────────────────────────────────────
-  # PATTERNS TO GROW INTO — copy, uncomment, rename. Commented out so the
+  # PATTERNS TO GROW INTO — copy, uncomment, rename (here before the first
+  # start, in Studio's YAML editor after it). Commented out so the
   # pod runs clean; validate_config.py checks them once enabled.
   # ─────────────────────────────────────────────────────────────────
 
@@ -453,12 +452,12 @@ agents:
   #     - agent: "resolver_agent"
   #       condition: "always"
 
-  # ── PATTERN B: a fanned-out BACKLOG worker — the `instances` modern
+  # ── PATTERN B: a fanned-out BACKLOG worker — the `scaling.copies` modern
   #    feature. One activation → N parallel copies in the same session.
   #    Give the copies an ATOMIC CLAIM tool (an LPOP / SELECT … SKIP LOCKED)
   #    so each pulls a DISJOINT batch — without it, copies duplicate work
   #    and the merge honestly shows two identical items. Do NOT multiply
-  #    triggers (a 3-line wake_up × instances:3 = 9 runs).
+  #    triggers (a 3-line wake_up × copies.count:3 = 9 runs).
   #
   # backlog_worker_agent:
   #   name: "backlog_worker_agent"
@@ -466,8 +465,11 @@ agents:
   #   description: "Clears the aging-request backlog in parallel"
   #   model: "gpt-4o-mini"
   #   communication_type: "chain"
-  #   instances: 3                 # 3 copies per activation
-  #   instances_handoff: last      # last = COMBINE + route once (default); each = route N times
+  #   scaling:                    # 2.4.484 (was instances / instances_handoff)
+  #     copies:
+  #       mode: fixed
+  #       count: 3               # 3 copies per activation
+  #       handoff: last          # last = COMBINE + route once (default); each = route N times
   #   tools: [claim_requests]      # the atomic claim splits the backlog between copies
   #   prompt: |
   #     Claim a batch of aging requests and summarise each.
@@ -510,8 +512,9 @@ agents:
 
   # ── PATTERN D: turn a specialist into a SUPER-AGENT for autonomous
   #    multi-step work (plan → execute → verify → reflect → finalize).
-  #    Tune it with the DICT form ONLY — the flat super_agent_* keys were
-  #    never wired and the env vars are dead as of 2.4.131. Enable it for
+  #    Tune it with the DICT form — the old flat super_agent_* keys are only
+  #    a legacy fallback, and the LEAFMESH_SUPER_AGENT_* env vars are not
+  #    read. Enable it for
   #    research/synthesis/multi-file work, NOT for one-shot classification
   #    (intake stays a plain LLM agent — faster and cheaper).
   #
