@@ -2,7 +2,7 @@
 day-0 with NO connector wired.
 
 This is a DEV STAND-IN, not a system of record. In production the requester
-lookup comes from your CRM / helpdesk (the `mcp` block in config.yaml), and the
+lookup comes from your CRM / helpdesk (the `mcp` block in the configuration), and the
 outbox + ledger are your real systems. **The function signatures are the contract
 you swap real systems into** — the mesh does not change (see the doctrine,
 `where data lives`).
@@ -45,24 +45,71 @@ def _write_json(name: str, data: Any) -> None:
     tmp.replace(_DATA_DIR / name)
 
 
-# ── Seed requesters — a tiny CRM stand-in so intake can demonstrate a
-#    system-of-record lookup on first run. Replace with a real CRM read
-#    (see the mcp block in config.yaml). Keyed by email OR display name. ──
+# ── Seed requesters — a small CRM stand-in so intake has real-looking
+#    accounts to look up on first run. Fictional companies and people only.
+#    Replace with a real CRM read (see the mcp block in the configuration). Keyed by
+#    email; lookup_requester() also matches the contact's full name.
+#    The mix exercises every route: enterprise + standard tiers, an account
+#    with a billing dispute open (refund/complaint → human), an account on
+#    credit hold, and a brand-new trial with no history.
+#    open_tickets counts the account's open support tickets; mrr_usd is the
+#    monthly recurring revenue on the current plan. ──
 SEED_REQUESTERS: dict[str, dict[str, Any]] = {
-    "a.rivera@example.com": {"name": "A. Rivera", "tier": "enterprise", "open_tickets": 1},
-    "m.osei@example.com":   {"name": "M. Osei",   "tier": "standard",   "open_tickets": 0},
+    "a.rivera@example.com": {
+        "name": "Ana Rivera", "company": "Brightwater Logistics", "account_id": "ACC-10042",
+        "tier": "enterprise", "plan": "Enterprise (annual)", "mrr_usd": 4800,
+        "open_tickets": 1, "customer_since": "2022-03-14", "account_status": "active",
+        "notes": "Invoice INV-2026-0518 (USD 4,800.00) charged twice on 2026-05-01.",
+    },
+    "m.osei@example.com": {
+        "name": "Michael Osei", "company": "Osei & Partners Architects", "account_id": "ACC-10317",
+        "tier": "standard", "plan": "Team (monthly)", "mrr_usd": 290,
+        "open_tickets": 0, "customer_since": "2024-08-02", "account_status": "active",
+        "notes": "",
+    },
+    "l.chen@example.com": {
+        "name": "Lena Chen", "company": "Fernhill Dental Group", "account_id": "ACC-10588",
+        "tier": "standard", "plan": "Team (annual)", "mrr_usd": 410,
+        "open_tickets": 3, "customer_since": "2023-11-20", "account_status": "active",
+        "notes": "Three open tickets about failed calendar sync; asked for a call-back twice.",
+    },
+    "r.haddad@example.com": {
+        "name": "Rami Haddad", "company": "Cedar Point Retail", "account_id": "ACC-10931",
+        "tier": "enterprise", "plan": "Enterprise (annual)", "mrr_usd": 7250,
+        "open_tickets": 0, "customer_since": "2021-06-07", "account_status": "credit_hold",
+        "notes": "Credit hold since 2026-10-15: invoice INV-2026-1004 (USD 7,250.00) 19 days overdue.",
+    },
+    "s.novak@example.com": {
+        "name": "Sara Novak", "company": "Novak Bakery Co.", "account_id": "ACC-11204",
+        "tier": "trial", "plan": "Trial (14 days)", "mrr_usd": 0,
+        "open_tickets": 0, "customer_since": "2026-10-28", "account_status": "trial",
+        "notes": "",
+    },
+    "j.okafor@example.com": {
+        "name": "James Okafor", "company": "Okafor Freight Brokers", "account_id": "ACC-10766",
+        "tier": "standard", "plan": "Team (monthly)", "mrr_usd": 290,
+        "open_tickets": 1, "customer_since": "2025-01-09", "account_status": "active",
+        "notes": "Open ticket: asked to change the billing contact.",
+    },
 }
 
 
 # ── Requester lookup (dev-store fallback for the CRM/mcp connector path) ──
 def lookup_requester(identifier: str) -> dict[str, Any]:
-    """Look a requester up in the dev CRM. Announces `available: false` when the
-    identifier is not seeded — never a synthetic 'unknown but fine' record."""
+    """Look a requester up in the dev CRM by email or full name. Announces
+    `available: false` when nothing matches — never a synthetic 'unknown but
+    fine' record."""
     key = (identifier or "").strip().lower()
     rec = SEED_REQUESTERS.get(key)
+    if not rec and key:
+        for email, r in SEED_REQUESTERS.items():
+            if str(r.get("name", "")).lower() == key:
+                key, rec = email, r
+                break
     if not rec:
         return {"available": False,
-                "reason": f"no seed requester for {identifier!r}; wire CRM_MCP_URL to look up real customers"}
+                "reason": (f"no seed requester for {identifier!r}; create the vault record "
+                           f"'crm_mcp' and wire the mcp block to look up real customers")}
     return {"available": True, "requester": key, **rec}
 
 
