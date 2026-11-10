@@ -11,15 +11,18 @@ and keep every property that makes a pod safe.
 A request arrives at one of several doors. The **intake officer** (an LLM with a
 fail-closed floor) looks the requester up in the system of record, reads the
 *intent*, and classifies it. Its `@chain` floor is the point of the whole design:
-a sensitive category (money, a complaint), a high priority, or a low-confidence
-read is FORCED to a human regardless of what the model said, and the request is
-stashed so it survives the human gate. Routine items with a real reply go straight
+a sensitive category (money, a complaint), a high priority, a confidence below 0.7,
+or a routine item with no draft is FORCED to a human regardless of what the model
+said, and the request is stashed so it survives the human gate. Routine items with a real reply go straight
 to the **resolution finisher**; sensitive ones go to **reviewer_human** first. The
 finisher never trusts that reaching it means "approved" — it re-derives
 authorisation in code, enforces invariants a prompt can't waive, renders the real
-artifact to `./out`, and **deletes it on a tripped floor**. Every terminal
-path — issued, rejected, or held-on-timeout — is recorded in a hash-chained WORM
-ledger. The **Manager** supervises and escalates stalls to the reviewer.
+artifact to `./out`, and **deletes it on a tripped floor**. Every decided
+path — issued, blocked, rejected, held — is recorded in a hash-chained WORM
+ledger. The **Manager** supervises and escalates real failures (an error retrying
+cannot fix, 2 agents failing in one session, restarts used up) to the reviewer.
+A request nobody answers is not escalated: after 24 hours its Inbox card closes
+and the ticket records that no reply came.
 
 ## Why it works in an organization
 
@@ -27,7 +30,7 @@ The triage decision is treated as a **safety** decision, not a convenience one, 
 the failure mode that matters — auto-resolving something that needed judgment —
 cannot happen quietly: it fails closed to a human. Routine work still deflects
 without a person. The reviewer is a first-class member and **silence never
-advances a request** (default-deny). The finisher's two-layer defense (body
+advances a request**: nothing is sent or approved without a person's answer. The finisher's two-layer defense (body
 short-circuits; `@chain` floor re-checks independently) means a partial artifact
 never escapes. And because the whole thing runs day-0 against a dev store that
 *announces itself*, a team can adopt the shape before wiring a single connector.
@@ -43,8 +46,8 @@ never escapes. And because the whole thing runs day-0 against a dev store that
               │     CRM lookup;                    │                        │
               │     playbook)                      ▼                        │
               │                              reviewer_human  (HITL,          │
- reviewer_reply ─────────────────────────>  dual boundary,   default-deny   │
-   (HITL resume)                             webhook)         on timeout)    │
+ reviewer_reply ─────────────────────────>  dual boundary,   never approves │
+   (HITL resume)                             Inbox)           on silence)    │
                                                 │                            │
                               ('approve')───────┼───────> resolver_agent ────┤
                                                 │          (re-check         │
@@ -55,12 +58,15 @@ never escapes. And because the whole thing runs day-0 against a dev store that
                                         audit_logger_agent <─────────────────┘
                                         (WORM terminus, can_call: [])
 
- SUPERVISOR: the LeafMesh Manager watches every hand-off; stalls / gate
- timeouts / contract violations escalate to reviewer_human (static routing).
+ SUPERVISOR: the LeafMesh Manager watches every hand-off; an error retrying
+ cannot fix, 2 failed agents in a session, or restarts used up escalate to
+ reviewer_human (static routing). Contract violations only alert people. An
+ unanswered gate is not escalated (2.4.486): after 24 h its card closes and
+ nothing is sent.
 ```
 
 The only cycle is the Manager's escalation back-edge, bounded by
-`auto_escalate.max_retries` / `max_errors_per_session` / `timeout_threshold`; the
+`auto_escalate.max_retries` / `max_errors_per_session`; the
 intake self-correction loop is bounded by `enforce_yields_retry`. Work flows
 forward, every branch terminates in audit.
 
@@ -77,7 +83,8 @@ forward, every branch terminates in audit.
   (`responsibility`) loads on demand. Demonstrates the per-agent playbook
   registry (requires `leafmesh>=2.4.130`).
 - Backing module `agency/intake_agent.py`: `@chain(enforce_triage_floor)`.
-  Forces `needs_human` on sensitive categories / high priority / no-draft;
+  Forces `needs_human` on sensitive categories / high priority / confidence
+  below `MIN_CONFIDENCE` (0.7; a missing confidence counts as 0) / no-draft;
   normalises the yields contract; mints a `request_id` if missing; stashes the
   request (session stash + dev store) for the finisher to recover post-gate.
 - Wires: `needs_human == true → reviewer_human`; `needs_human == false →
@@ -102,12 +109,16 @@ forward, every branch terminates in audit.
 
 ### Human members
 
-**`reviewer_human` — Request Reviewer & Accountable Owner** (human, `dual`, webhook)
+**`reviewer_human` — Support Team Lead (Request Reviewer & Accountable Owner)** (human, `dual`, Studio Inbox)
 - Approves / declines sensitive requests; owns everything that leaves the pod;
-  the Manager's escalation target.
-- **Default-deny**: `fallback_on_timeout: true`, fallback resolves to
-  `human_message: held_for_review`, which matches the route to audit — silence is
-  recorded, never advanced.
+  the Manager's escalation target. SLA: one business day
+  (`human_timeout_seconds: 86400`).
+- **Never approves on silence.** On 2.4.486 a dual seat's timeout routes nothing:
+  the Inbox card closes and the ticket records that no reply came. The declared
+  `fallback_on_timeout: true` / `human_message: held_for_review` matches the route
+  to audit and is kept for when the SDK sends a dual seat's fallback on.
+- On silence a real team escalates to the **Support Manager** after one business
+  day — not wired yet.
 - Wires (on `human_message`): `'approve' → resolver_agent`;
   `'reject' or 'held_for_review' → audit_logger_agent`.
 - `dual` is confined to this boundary agent (AI peers are `chain`) — no
@@ -116,7 +127,7 @@ forward, every branch terminates in audit.
 ### Controls
 
 **`audit_logger_agent` — Compliance Recorder** (external, `framework: custom`,
-`execute`)
+`chain`)
 - Hash-chained, append-only WORM sink registered via
   `sdk.intelligence("audit_logger_agent")` in `main.py`. Terminus of every path;
   `can_call: []`.
@@ -124,7 +135,9 @@ forward, every branch terminates in audit.
 ### Supervisor
 
 **LeafMesh Manager** (`gpt-4o-mini`, static routing) — reads every hand-off;
-escalates stalls, gate timeouts, and contract violations to `reviewer_human`.
+escalates to `reviewer_human` on an error retrying cannot fix, on 2 failed agents
+in one session (`max_errors_per_session: 2`), or when restarts are used up. It
+does not escalate an unanswered question; a broken output contract only alerts.
 
 ## Entry points (the doors)
 
@@ -153,10 +166,10 @@ escalates stalls, gate timeouts, and contract violations to `reviewer_human`.
 | **playbook** | `intake_agent` | **Live** — `description` resident, `responsibility` on demand. |
 | **dev-store tools** | `agency/tools.py` + `store.py` | **Live** — `lookup_requester`, announces `available:false`. |
 | **finisher** | `resolver_agent` | **Live** — allow/deny + fail-closed + render + delete-on-block. |
-| **default-deny HITL** | `reviewer_human` | **Live** — timeout → `held_for_review` → audit. |
+| **default-deny HITL** | `reviewer_human` | **Live** — nothing approved on silence; the `held_for_review` fallback is declared (a dual seat's timeout does not send it on in 2.4.486). |
 | **WORM sink** | `audit_logger_agent` | **Live** — hash-chained, `sdk.intelligence()`. |
-| **mcp** | `intake_agent` | Commented (empty-URL rejected at load) + dev-store fallback. |
-| **instances** + atomic claim | Pattern B | Commented grow-into. |
+| **mcp** | `intake_agent` | Commented (picks vault connection `crm_mcp`) + dev-store fallback. |
+| **scaling.copies** + atomic claim | Pattern B | Commented grow-into. |
 | **wake_up** + `timezone` | Pattern C | Commented grow-into (UTC trap called out). |
 | **super_agent** (dict form) | Pattern D | Commented grow-into (dict-only tuning). |
 
@@ -164,8 +177,8 @@ escalates stalls, gate timeouts, and contract violations to `reviewer_human`.
 
 - Default-deny gate, every wire conditional, bounded escalation/retry loops, WORM
   terminus.
-- `validate_config.py` clean (structure); loads on SDK 2.4.131 with **0 dual
-  warnings**; both backing modules bind by name (no dead code); the fail-closed
-  floors are unit-tested with no LLM/Redis in `tests/test_finisher.py`.
+- `leafmesh config check` clean (structure); starts on leafmesh 2.4.486; both
+  backing modules bind by name (no dead code); the fail-closed floors and the
+  seed lookup are unit-tested with no LLM/Redis in `tests/test_finisher.py`.
 - The pod's discipline in one sentence: **agents produce, the human decides, the
   system records — and silence never advances anything.**

@@ -6,6 +6,8 @@ the request, looks the requester up, and classifies; this CODE fails closed.
 @chain enforce_triage_floor — the deterministic floor a prompt can't waive:
   • a sensitive category (money / complaint) or a high-priority item ALWAYS
     needs a human, whatever the model decided;
+  • a low-confidence read (confidence below MIN_CONFIDENCE = 0.7, or no
+    confidence at all) needs a human;
   • a 'routine' item with nothing to say can't be auto-resolved → send it to a
     human;
   • every request gets an addressable id (minted if missing);
@@ -37,7 +39,19 @@ logger = LeafMeshLogger(__name__)
 
 # Categories that ALWAYS require a human, whatever the model says.
 _SENSITIVE = frozenset({"complaint", "refund", "money", "legal", "billing"})
-_STASH_KEYS = ("request_id", "category", "priority", "needs_human", "draft_reply", "summary")
+# Below this the model is guessing; a person reads it. Keep equal to the
+# prompt, the playbook and the README (0.7).
+MIN_CONFIDENCE = 0.7
+_STASH_KEYS = ("request_id", "category", "priority", "needs_human", "draft_reply",
+               "summary", "confidence")
+
+
+def _confidence(value: Any) -> float:
+    """The model's confidence as a number; anything unreadable is 0.0 (fail closed)."""
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def enforce_triage_floor(result: Any, context: dict) -> dict:
@@ -53,6 +67,7 @@ def enforce_triage_floor(result: Any, context: dict) -> dict:
     result.setdefault("draft_reply", "")
     result.setdefault("summary", "")
     result.setdefault("request_id", "")
+    result["confidence"] = _confidence(result.get("confidence"))
 
     # Mint an addressable id if the model didn't echo one (an id is plumbing,
     # not a fabricated fact).
@@ -63,6 +78,9 @@ def enforce_triage_floor(result: Any, context: dict) -> dict:
     cat = str(result.get("category") or "").lower()
     pri = str(result.get("priority") or "").lower()
     if cat in _SENSITIVE or pri == "high":
+        result["needs_human"] = True
+    if result["confidence"] < MIN_CONFIDENCE:
+        # A guess is not a decision — a person reads it.
         result["needs_human"] = True
     if result.get("needs_human") is False and not str(result.get("draft_reply") or "").strip():
         # A routine item with nothing to say can't be auto-resolved.
@@ -75,7 +93,7 @@ def enforce_triage_floor(result: Any, context: dict) -> dict:
     store.put_request(result["request_id"], parcel)
 
     logger.info(f"[intake] {result['request_id']} category={cat} "
-                f"needs_human={result['needs_human']}")
+                f"confidence={result['confidence']:.2f} needs_human={result['needs_human']}")
     return result
 
 

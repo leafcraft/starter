@@ -1,12 +1,12 @@
 """starter — Starter Pod entry point (LeafMesh).
 
 Boot order matters (SDK 2.4.131):
-  1. import agency.tools  → the @global_tool decorators run BEFORE from_yaml/start,
+  1. import agency.tools  → the @global_tool decorators run BEFORE from_store/start,
      so intake's lookup_requester is registered.
-  2. LeafMesh.from_yaml(...) → auto_discover wires agency/*_agent.py to the YAML
+  2. LeafMesh.from_store() → auto_discover wires agency/*_agent.py to the YAML
      (intake floor + resolver finisher).
   3. audit_logger.register(...) → attach the WORM sink to the custom external
-     audit_logger_agent (must be after from_yaml, before start).
+     audit_logger_agent (must be after from_store, before start).
   4. leafmesh.start().
 """
 import asyncio
@@ -22,10 +22,10 @@ from agency._shared import audit_logger as _audit_logger
 load_dotenv()
 logger = LeafMeshLogger(__name__)
 
-leafmesh = LeafMesh.from_yaml("configs/config.yaml")
+leafmesh = LeafMesh.from_store()
 
 # WORM audit sink — terminus for resolutions, rejections, AND held gates.
-# Must happen after from_yaml() and before start().
+# Must happen after from_store() and before start().
 _audit_logger.register(leafmesh, "audit_logger_agent")
 
 
@@ -44,10 +44,8 @@ async def main():
     leafmesh.event_bus.subscribe(EventType.INTERVENTION_NEEDED,  _on_intervention_needed)
     leafmesh.event_bus.subscribe(EventType.HUMAN_INPUT_TIMEOUT,  _on_human_input_timeout)
 
-    try:
-        await leafmesh.enable_self_healing()
-    except AttributeError:
-        pass
+    # Self-healing is automatic — the SDK enables it during start() on
+    # every operator-facing mesh. No call is needed.
 
     agents = leafmesh.registry.list_agents() if getattr(leafmesh, "registry", None) else []
     if agents:
