@@ -1,6 +1,6 @@
 """Resolver — the FINISHER / actuator (the artifact-producing executor).
 
-auto_discover matches `resolver_agent`. The resolver sits AFTER the human gate.
+auto_discover matches `resolver_agent`. The resolver sits AFTER the human step.
 It never decides policy — it re-checks that it is genuinely authorised, renders
 the real resolution record, and records an append-only ledger entry. It is the
 concrete "@chain fails closed":
@@ -13,7 +13,7 @@ concrete "@chain fails closed":
      addressable id, something to actually say).
   c) render the real artifact to ./out; on a tripped floor, DELETE the partial
      and record status:blocked with reasons — never a half-issued result.
-  d) dev-store recovery — after the HITL gate the upstream payload is dropped,
+  d) dev-store recovery — after the human step the upstream payload is dropped,
      so the finisher recovers the request from the session stash / dev store,
      and its outbox record ANNOUNCES it is a dev-store record (never a fake ack).
 
@@ -54,7 +54,7 @@ def _signal(input_data: dict) -> str:
     if isinstance(up, dict):
         sources.extend(v for v in up.values() if isinstance(v, dict))
     for src in sources:
-        for key in ("human_message", "human_decision", "decision", "message"):
+        for key in ("verdict", "human_message", "human_decision", "decision", "message"):
             val = src.get(key)
             if isinstance(val, str) and val.strip():
                 return val.strip().lower()

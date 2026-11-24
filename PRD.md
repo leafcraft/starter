@@ -13,7 +13,7 @@ fail-closed floor) looks the requester up in the system of record, reads the
 *intent*, and classifies it. Its `@chain` floor is the point of the whole design:
 a sensitive category (money, a complaint), a high priority, a confidence below 0.7,
 or a routine item with no draft is FORCED to a human regardless of what the model
-said, and the request is stashed so it survives the human gate. Routine items with a real reply go straight
+said, and the request is stashed so it survives the human step. Routine items with a real reply go straight
 to the **resolution finisher**; sensitive ones go to **reviewer_human** first. The
 finisher never trusts that reaching it means "approved" — it re-derives
 authorisation in code, enforces invariants a prompt can't waive, renders the real
@@ -21,8 +21,8 @@ artifact to `./out`, and **deletes it on a tripped floor**. Every decided
 path — issued, blocked, rejected, held — is recorded in a hash-chained WORM
 ledger. The **Manager** supervises and escalates real failures (an error retrying
 cannot fix, 2 agents failing in one session, restarts used up) to the reviewer.
-A request nobody answers is not escalated: after 24 hours its Inbox card closes
-and the ticket records that no reply came.
+A request nobody answers is not escalated: after 24 hours the reviewer's default
+reply, `hold`, records it in the audit log and nothing is sent.
 
 ## Why it works in an organization
 
@@ -46,13 +46,13 @@ never escapes. And because the whole thing runs day-0 against a dev store that
               │     CRM lookup;                    │                        │
               │     playbook)                      ▼                        │
               │                              reviewer_human  (HITL,          │
- reviewer_reply ─────────────────────────>  dual boundary,   never approves │
+ reviewer_reply ─────────────────────────>  chain, reader,   never approves │
    (HITL resume)                             Inbox)           on silence)    │
                                                 │                            │
-                              ('approve')───────┼───────> resolver_agent ────┤
+                              (verdict approve)─┼───────> resolver_agent ────┤
                                                 │          (re-check         │
-                              ('reject' /       │           approve token,   │
-                               'held_for_review')          invariants,       │
+                              (verdict reject / │           approve token,   │
+                               hold)            │          invariants,       │
                                                 │           render ./out,    │
                                                 ▼           delete-on-block) │
                                         audit_logger_agent <─────────────────┘
@@ -61,8 +61,8 @@ never escapes. And because the whole thing runs day-0 against a dev store that
  SUPERVISOR: the LeafMesh Manager watches every hand-off; an error retrying
  cannot fix, 2 failed agents in a session, or restarts used up escalate to
  reviewer_human (static routing). Contract violations only alert people. An
- unanswered gate is not escalated (2.4.486): after 24 h its card closes and
- nothing is sent.
+ unanswered gate is not escalated: after 24 h its default reply (hold) goes
+ to the audit log and nothing is sent.
 ```
 
 The only cycle is the Manager's escalation back-edge, bounded by
@@ -109,20 +109,22 @@ forward, every branch terminates in audit.
 
 ### Human members
 
-**`reviewer_human` — Support Team Lead (Request Reviewer & Accountable Owner)** (human, `dual`, Studio Inbox)
+**`reviewer_human` — Support Team Lead (Request Reviewer & Accountable Owner)** (human, `chain` with a reply reader, Studio Inbox)
 - Approves / declines sensitive requests; owns everything that leaves the pod;
   the Manager's escalation target. SLA: one business day
   (`human_timeout_seconds: 86400`).
-- **Never approves on silence.** On 2.4.486 a dual seat's timeout routes nothing:
-  the Inbox card closes and the ticket records that no reply came. The declared
-  `fallback_on_timeout: true` / `human_message: held_for_review` matches the route
-  to audit and is kept for when the SDK sends a dual seat's fallback on.
+- **Replies are read, not clicked.** The Inbox has no buttons: the reviewer types
+  a reply and the reply reader (`gpt-4o-mini`) turns it into a `verdict` —
+  `approve`, `reject`, `hold`, or `answer` (they answered the intake agent's
+  question). Anything that is not a clear yes reads as `hold`.
+- **Never approves on silence.** On timeout the declared
+  `fallback_on_timeout: true` / `verdict: hold` (`held_for_review`) goes through
+  the routes like any reply and lands in the audit log.
 - On silence a real team escalates to the **Support Manager** after one business
   day — not wired yet.
-- Wires (on `human_message`): `'approve' → resolver_agent`;
-  `'reject' or 'held_for_review' → audit_logger_agent`.
-- `dual` is confined to this boundary agent (AI peers are `chain`) — no
-  `dual → dual` ping-pong.
+- Wires (on `verdict`): `approve → resolver_agent`;
+  `reject` or `hold → audit_logger_agent`; `answer` → back to `intake_agent`
+  only when it asked.
 
 ### Controls
 
@@ -166,7 +168,7 @@ does not escalate an unanswered question; a broken output contract only alerts.
 | **playbook** | `intake_agent` | **Live** — `description` resident, `responsibility` on demand. |
 | **dev-store tools** | `agency/tools.py` + `store.py` | **Live** — `lookup_requester`, announces `available:false`. |
 | **finisher** | `resolver_agent` | **Live** — allow/deny + fail-closed + render + delete-on-block. |
-| **default-deny HITL** | `reviewer_human` | **Live** — nothing approved on silence; the `held_for_review` fallback is declared (a dual seat's timeout does not send it on in 2.4.486). |
+| **default-deny HITL** | `reviewer_human` | **Live** — nothing approved on silence; on timeout the `hold` fallback routes to the audit log. |
 | **WORM sink** | `audit_logger_agent` | **Live** — hash-chained, `sdk.intelligence()`. |
 | **mcp** | `intake_agent` | Commented (picks vault connection `crm_mcp`) + dev-store fallback. |
 | **scaling.copies** + atomic claim | Pattern B | Commented grow-into. |

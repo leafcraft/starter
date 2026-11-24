@@ -4,7 +4,7 @@ When a human approves/rejects in their channel, the SDK resumes the chain with
 ONLY the human-response meta fields (`human_message`, `human_decision`, …) — the
 request payload flowing through the chain is NOT re-delivered to the next agent.
 So intake stashes the full request context here, keyed by `session_id`, and the
-finisher (resolver) recovers it after the human gate.
+finisher (resolver) recovers it after the human step.
 
 In-process only — survives the human wait because the mesh is one process. A
 multi-replica deployment swaps this for the Redis session store; the get/put

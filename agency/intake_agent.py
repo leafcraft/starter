@@ -12,7 +12,7 @@ the request, looks the requester up, and classifies; this CODE fails closed.
     human;
   • every request gets an addressable id (minted if missing);
   • the request is stashed (session + dev store) so the finisher can recover it
-    AFTER the HITL gate, when the SDK re-delivers only human_* meta.
+    AFTER the human step, when the SDK re-delivers only human_* meta.
 
 Note the signatures: an `llm` agent function takes EXACTLY three params
 (llm_response, input_data, context) or it is silently never called; a @chain
@@ -86,7 +86,7 @@ def enforce_triage_floor(result: Any, context: dict) -> dict:
         # A routine item with nothing to say can't be auto-resolved.
         result["needs_human"] = True
 
-    # Stash the request so the finisher can recover it across the HITL gate.
+    # Stash the request so the finisher can recover it across the human step.
     sid = resolve_session_id({}, context)
     parcel = {k: result.get(k) for k in _STASH_KEYS}
     stash_put(sid, parcel)

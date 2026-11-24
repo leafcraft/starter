@@ -1,12 +1,12 @@
 # starter — Starter Pod
 
-The **smallest honest LeafMesh pod**: a triage specialist, a human review gate, a
+The **smallest honest LeafMesh pod**: a triage specialist, a human review, a
 finisher that produces the real artifact, and a WORM audit terminus — watched by
 a supervisor. Not a pipeline; a team. Clone it, rename the roles, and grow your
 own department without unlearning anything.
 
 **Read `PRD.md`** for the full agent-by-agent spec. This is a **pod-standard
-skeleton** (leafmesh 2.4.486): every wire is conditional, the human gate never
+skeleton** (leafmesh 2.4.528): every wire is conditional, the human step never
 approves on silence, the finisher fails closed, and every decision ends in the
 audit sink.
 
@@ -28,8 +28,8 @@ hash-chained entry to the **audit log**. A second message the same morning —
 *"what are your opening hours?"* — is classified `question / needs_human: false`,
 skips the human, and the finisher issues it directly against the auto-resolvable
 allowlist. If the reviewer had not answered the refund within 24 hours, nothing
-would have gone out: the Inbox card closes, the ticket records that no reply came,
-and nobody is chased automatically. Silence never approves anything.
+would have gone out: the seat's default reply, `hold`, would have taken the
+request to the audit log, and nobody is chased automatically. Silence never approves anything.
 
 ## Why it works in an organization
 
@@ -51,7 +51,7 @@ that needed judgment, and a complete audit trail for compliance.
 | Agent | Role (human job title) | Responsibilities | Can perform |
 |---|---|---|---|
 | `intake_agent` | Intake & Triage Officer | Reads each incoming request, looks the requester up in the system of record, classifies it, and decides — failing closed — whether a human must see it | LLM (chain) + **playbook** (triage craft, loaded on demand) + dev-store `lookup_requester` tool; `@chain` **triage floor** forces a human on a refund/complaint, high priority, confidence below 0.7, or a routine item with no draft, and stashes the request for the finisher |
-| `reviewer_human` | Support Team Lead — request reviewer & accountable owner (Human) | Approves or declines sensitive requests before any reply goes out; owns everything that leaves the pod. Answers within one business day (24 h) | Human gate (Studio Inbox, dual boundary); replies `approve` / `reject`; **never approves on silence** — after 24 h the card closes unanswered (see *If nobody answers*); also the Manager's escalation target |
+| `reviewer_human` | Support Team Lead — request reviewer & accountable owner (Human) | Approves or declines sensitive requests before any reply goes out; owns everything that leaves the pod. Answers within one business day (24 h) | Human step (Studio Inbox, `chain` with a reply reader); types a reply, read as `approve` / `reject` / `hold`, or `answer` when replying to the intake agent's question; **never approves on silence** — after 24 h its default reply `hold` goes to the audit log (see *If nobody answers*); also the Manager's escalation target |
 | `resolver_agent` | Resolution Finisher | Produces the real resolution artifact only when genuinely authorised, then records it | Programmatic **finisher**: approve-token allowlist + block-token denylist + auto-resolvable-category allowlist (fail closed on unknown) → invariants → render to `./out` → **delete-on-block** → dev-store outbox + ledger |
 | `audit_logger_agent` | Compliance Recorder (WORM) | Hash-chains every issued resolution, rejection, and held gate | External (custom sink), registered via `sdk.intelligence()`; terminus — `can_call: []` |
 
@@ -63,13 +63,16 @@ agent's restarts are used up. A broken output contract only alerts people.
 
 ### If nobody answers
 
+The Inbox has no buttons. The reviewer types a reply, and a small reply reader
+(`gpt-4o-mini`) turns it into a `verdict`: `approve`, `reject`, `hold`, or
+`answer` (they answered the intake agent's question; it goes back to that agent
+only). Anything that is not a clear yes — no, not now, wait — reads as `hold`.
+
 `reviewer_human` waits 24 hours (`human_timeout_seconds: 86400`). If nobody
-answers, the request waits no longer: its Inbox card closes and the ticket records
-that no reply came. Nothing is sent or approved on silence, and nobody is chased
-automatically — the Manager does not escalate an unanswered question. The seat's
-`fallback_response` (`held_for_review`, which matches the route to audit) is kept
-as the declared intent; on 2.4.486 a dual seat's timeout does not send it on. A
-real support team would escalate an unanswered refund to the **Support Manager**
+answers, the seat's default reply (`verdict: hold`, `held_for_review`) goes
+through its routes like any reply and is recorded in the audit log. Nothing is
+sent or approved on silence, and nobody is chased automatically — the Manager
+does not escalate an unanswered question. A real support team would escalate an unanswered refund to the **Support Manager**
 after one business day; that route is not wired yet.
 
 ## Configuration — what to set, in three tiers
@@ -82,7 +85,7 @@ for anyone not seeded, until you wire Tier 2.
 ### Tier 1 — required to boot (dev mode)
 | Setting | For | Notes |
 |---|---|---|
-| `LEAFMESH_LICENSE_KEY` | LeafMesh runtime | **Required.** |
+| `LEAFMESH_LICENSE_KEY` | first start | Not kept in `.env`: `create-leafmesh --start` (or `--load`) asks for it once at the first start to sign this environment in (leafmesh 2.4.538+) |
 | `OPENAI_API_KEY` | Intake + Manager (`gpt-4o-mini`) | **Required** unless you change the models. |
 | `REDIS_HOST` / `PORT` / `PASSWORD` | State store | Defaults to `localhost:6379`. Bring your own Redis, or let `create-leafmesh --start .` start one. |
 | *(no setting)* — the reviewer | Human review | Answers in Studio's Inbox. To notify an external tool instead, create a vault connection (an "Add custom" record on the Infrastructure page, service type 'Outbound webhook') and set `webhook_config: {connection: <name>}` on the seat. |

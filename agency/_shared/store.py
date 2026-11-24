@@ -113,7 +113,7 @@ def lookup_requester(identifier: str) -> dict[str, Any]:
     return {"available": True, "requester": key, **rec}
 
 
-# ── Request recovery across the HITL gate (finisher reads this post-review) ──
+# ── Request recovery across the human step (finisher reads this post-review) ──
 def put_request(request_id: str, req: dict[str, Any]) -> None:
     if not request_id:
         return
